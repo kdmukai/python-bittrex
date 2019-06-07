@@ -2,10 +2,11 @@
    See https://bittrex.com/Home/Api
 """
 
-import time
 import hmac
 import hashlib
+import json
 import sys
+import time
 try:
     from urllib import urlencode
 except ImportError:
@@ -18,7 +19,6 @@ except ImportError:
 else:
     import getpass
     import ast
-    import json
 
     encrypted = True
 
@@ -36,6 +36,11 @@ TICKINTERVAL_HOUR = 'hour'
 TICKINTERVAL_THIRTYMIN = 'thirtyMin'
 TICKINTERVAL_DAY = 'Day'
 
+CANDLEINTERVAL_ONEMIN = 'MINUTE_1'
+CANDLEINTERVAL_FIVEMIN = 'MINUTE_5'
+CANDLEINTERVAL_HOUR = 'HOUR_1'
+CANDLEINTERVAL_DAY = 'DAY_1'
+
 ORDERTYPE_LIMIT = 'LIMIT'
 ORDERTYPE_MARKET = 'MARKET'
 
@@ -51,9 +56,11 @@ CONDITIONTYPE_STOP_LOSS_PERCENTAGE = 'STOP_LOSS_PERCENTAGE'
 
 API_V1_1 = 'v1.1'
 API_V2_0 = 'v2.0'
+API_V3_0 = 'v3.0'
 
 BASE_URL_V1_1 = 'https://bittrex.com/api/v1.1{path}?'
 BASE_URL_V2_0 = 'https://bittrex.com/api/v2.0{path}?'
+BASE_URL_V3_0 = 'https://api.bittrex.com/v3{path}?'
 
 PROTECTION_PUB = 'pub'  # public methods
 PROTECTION_PRV = 'prv'  # authenticated methods
@@ -120,7 +127,7 @@ class Bittrex(object):
 
             self.last_call = time.time()
 
-    def _api_query(self, protection=None, path_dict=None, options=None):
+    def _api_query(self, protection=None, path_dict=None, options=None, method='GET', payload=None):
         """
         Queries Bittrex
 
@@ -136,39 +143,110 @@ class Bittrex(object):
         if self.api_version not in path_dict:
             raise Exception('method call not available under API version {}'.format(self.api_version))
 
-        request_url = BASE_URL_V2_0 if self.api_version == API_V2_0 else BASE_URL_V1_1
-        request_url = request_url.format(path=path_dict[self.api_version])
+        if self.api_version == API_V3_0:
+            request_url = BASE_URL_V3_0
+            request_url = request_url.format(path=path_dict[self.api_version])
+            request_url += urlencode(options)
 
-        nonce = str(int(time.time() * 1000))
+            if request_url.endswith('?'):
+                request_url = request_url[:-1]
 
-        if protection != PROTECTION_PUB:
-            request_url = "{0}apikey={1}&nonce={2}&".format(request_url, self.api_key, nonce)
+            headers = {}
+            if protection == PROTECTION_PRV:
+                """
+                    the following headers must be included:
+                        Api-Key
+                        Api-Timestamp
+                        Api-Content-Hash
+                        Api-Signature
+                        Api-Subaccount-Id (optional)
+                """
+                # headers['Content-Type'] = 'multipart/form-data'
+                headers['Api-Key'] = self.api_key
+                headers['Api-Timestamp'] = str(int(time.time() * 1000))
 
-        request_url += urlencode(options)
+                print(urlencode(payload))
 
-        try:
-            if sys.version_info >= (3, 0) and protection != PROTECTION_PUB:
+                if payload:
+                    # Payload must be a querystring-like key=value,key2=value2, etc string
+                    # headers['Api-Content-Hash'] = hashlib.sha512(urlencode(payload).encode('utf8')).hexdigest()
+                    headers['Api-Content-Hash'] = hashlib.sha512(json.dumps(payload).encode('utf8')).hexdigest()
+                else:
+                    # Just encode empty string
+                    headers['Api-Content-Hash'] = hashlib.sha512(''.encode('UTF-8')).hexdigest()
 
-                apisign = hmac.new(bytearray(self.api_secret, 'ascii'),
-                                   bytearray(request_url, 'ascii'),
-                                   hashlib.sha512).hexdigest()
+                """
+                    Create a pre-sign string formed from the following items and concatenating them together:
+
+                    1. Contents of your Api-Timestamp header
+                    2. The full URI you are using to make the request (including query string)
+                    3. The HTTP method of the request, in all caps (GET, POST, DELETE, etc.)
+                    4. Contents of your Api-Content-Hash header
+                    5. Contents of your Api-Subaccount-Id header (or an empty string if not present)
+                """
+                signature_msg = headers['Api-Timestamp']
+                signature_msg += request_url
+                signature_msg += method
+                signature_msg += headers['Api-Content-Hash']
+
+                # print(signature_msg)
+
+                headers['Api-Signature'] = hmac.new(
+                    bytearray(self.api_secret, 'ascii'),
+                    bytearray(signature_msg, 'ascii'),
+                    hashlib.sha512
+                ).hexdigest()
+
+                # print(headers)
+
+            print(request_url)
+
+            if method == 'GET':
+                return requests.get(request_url, headers=headers).json()
+
+            elif method == 'POST':
+                return requests.post(request_url, headers=headers, json=payload).json()
+
+            elif method == 'DELETE':
+                return requests.delete(request_url, headers=headers).json()
 
             else:
+                raise Exception("method %s not implemented!" % method)
 
-                apisign = hmac.new(self.api_secret.encode(),
-                                   request_url.encode(),
-                                   hashlib.sha512).hexdigest()
+        else:
+            request_url = BASE_URL_V2_0 if self.api_version == API_V2_0 else BASE_URL_V1_1
+            request_url = request_url.format(path=path_dict[self.api_version])
 
-            self.wait()
+            nonce = str(int(time.time() * 1000))
 
-            return self.dispatch(request_url, apisign)
+            if protection != PROTECTION_PUB:
+                request_url = "{0}apikey={1}&nonce={2}&".format(request_url, self.api_key, nonce)
 
-        except Exception:
-            return {
-                'success': False,
-                'message': 'NO_API_RESPONSE',
-                'result': None
-            }
+            request_url += urlencode(options)
+
+            try:
+                if sys.version_info >= (3, 0) and protection != PROTECTION_PUB:
+
+                    apisign = hmac.new(bytearray(self.api_secret, 'ascii'),
+                                       bytearray(request_url, 'ascii'),
+                                       hashlib.sha512).hexdigest()
+
+                else:
+
+                    apisign = hmac.new(self.api_secret.encode(),
+                                       request_url.encode(),
+                                       hashlib.sha512).hexdigest()
+
+                self.wait()
+
+                return self.dispatch(request_url, apisign)
+
+            except Exception:
+                return {
+                    'success': False,
+                    'message': 'NO_API_RESPONSE',
+                    'result': None
+                }
 
     def get_markets(self):
         """
@@ -177,6 +255,7 @@ class Bittrex(object):
 
         1.1 Endpoint: /public/getmarkets
         2.0 NO Equivalent
+        3.0 Endpoint: /markets
 
         Example ::
             {'success': True,
@@ -201,6 +280,16 @@ class Bittrex(object):
         """
         return self._api_query(path_dict={
             API_V1_1: '/public/getmarkets',
+            API_V3_0: '/markets',
+        }, protection=PROTECTION_PUB)
+
+    def get_market(self, market):
+        """
+        :return: Available market info in JSON
+        :rtype : dict
+        """
+        return self._api_query(path_dict={
+            API_V3_0: '/markets/%s' % market,
         }, protection=PROTECTION_PUB)
 
     def get_currencies(self):
@@ -217,7 +306,8 @@ class Bittrex(object):
         """
         return self._api_query(path_dict={
             API_V1_1: '/public/getcurrencies',
-            API_V2_0: '/pub/Currencies/GetCurrencies'
+            API_V2_0: '/pub/Currencies/GetCurrencies',
+            API_V3_0: '/currencies'
         }, protection=PROTECTION_PUB)
 
     def get_ticker(self, market):
@@ -227,15 +317,22 @@ class Bittrex(object):
         Endpoints:
         1.1 /public/getticker
         2.0 NO EQUIVALENT -- but get_latest_candle gives comparable data
+        3.0 /markets/{marketSymbol}/ticker
 
         :param market: String literal for the market (ex: BTC-LTC)
         :type market: str
         :return: Current values for given market in JSON
         :rtype : dict
         """
-        return self._api_query(path_dict={
-            API_V1_1: '/public/getticker',
-        }, options={'market': market}, protection=PROTECTION_PUB)
+        if self.api_version == API_V3_0:
+            return self._api_query(path_dict={
+                API_V3_0: '/markets/%s/ticker' % market,
+            }, protection=PROTECTION_PUB)
+
+        else:
+            return self._api_query(path_dict={
+                API_V1_1: '/public/getticker',
+            }, options={'market': market}, protection=PROTECTION_PUB)
 
     def get_market_summaries(self):
         """
@@ -354,6 +451,53 @@ class Bittrex(object):
                     'quantity': quantity,
                     'rate': rate}, protection=PROTECTION_PRV)
 
+    def market_buy(self, market, quantity):
+        """
+            {
+                "marketSymbol": "string",
+                "direction": "BUY",
+                "type": "MARKET",
+                "quantity": "number (double)",
+                "timeInForce": "IMMEDIATE_OR_CANCEL||FILL_OR_KILL",
+                "clientOrderId": "string (uuid)"
+            }
+
+            Response:
+            {
+                "id": "string (uuid)",
+                "marketSymbol": "string",
+                "direction": "string",
+                "type": "string",
+                "quantity": "number (double)",
+                "limit": "number (double)",
+                "ceiling": "number (double)",
+                "timeInForce": "string",
+                "expiresAt": "string (date-time)",
+                "clientOrderId": "string (uuid)",
+                "fillQuantity": "number (double)",
+                "commission": "number (double)",
+                "proceeds": "number (double)",
+                "status": "string",
+                "createdAt": "string (date-time)",
+                "updatedAt": "string (date-time)",
+                "closedAt": "string (date-time)"
+            }            
+        """
+        return self._api_query(
+            path_dict={
+                API_V3_0: '/orders',
+            }, 
+            payload={
+                'marketSymbol': market,
+                'direction': 'BUY',
+                'type': 'MARKET',
+                'quantity': f'{quantity:0.8f}',
+                'timeInForce': 'IMMEDIATE_OR_CANCEL'
+            },
+            method='POST',
+            protection=PROTECTION_PRV
+        )
+
     def sell_limit(self, market, quantity, rate):
         """
         Used to place a sell order in a specific market. Use selllimit to place
@@ -424,6 +568,7 @@ class Bittrex(object):
         Endpoint:
         1.1 /account/getbalances
         2.0 /key/balance/GetBalances
+        3. /balances
 
         Example ::
             {'success': True,
@@ -443,7 +588,8 @@ class Bittrex(object):
         """
         return self._api_query(path_dict={
             API_V1_1: '/account/getbalances',
-            API_V2_0: '/key/balance/GetBalances'
+            API_V2_0: '/key/balance/GetBalances',
+            API_V3_0: '/balances'
         }, protection=PROTECTION_PRV)
 
     def get_balance(self, currency):
@@ -792,6 +938,7 @@ class Bittrex(object):
         Endpoint:
         1.1 NO EQUIVALENT
         2.0 /pub/market/GetTicks
+        3.0 /markets/{marketSymbol}/candles {candleInterval: ["MINUTE_1", "MINUTE_5", "HOUR_1", "DAY_1"]}
 
         Example  ::
             { success: true,
@@ -816,12 +963,18 @@ class Bittrex(object):
         :return: Available tick candles in JSON
         :rtype: dict
         """
-
-        return self._api_query(path_dict={
-            API_V2_0: '/pub/market/GetTicks'
-        }, options={
-            'marketName': market, 'tickInterval': tick_interval
-        }, protection=PROTECTION_PUB)
+        if self.api_version == API_V3_0:
+            return self._api_query(path_dict={
+                API_V3_0: '/markets/%s/candles' % market
+            }, options={
+                'candleInterval': tick_interval
+            }, protection=PROTECTION_PUB)
+        else:
+            return self._api_query(path_dict={
+                API_V2_0: '/pub/market/GetTicks'
+            }, options={
+                'marketName': market, 'tickInterval': tick_interval
+            }, protection=PROTECTION_PUB)
 
     def get_latest_candle(self, market, tick_interval):
         """
@@ -847,7 +1000,6 @@ class Bittrex(object):
         :return: Available latest tick candle in JSON
         :rtype: dict
         """
-
         return self._api_query(path_dict={
             API_V2_0: '/pub/market/GetLatestTick'
         }, options={
